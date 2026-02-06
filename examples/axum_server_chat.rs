@@ -193,8 +193,8 @@ async fn chat_page(Query(query): Query<ChatPageQuery>) -> Html<String> {
         r#"<!doctype html>
 <html>
 <head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Websocket Chat Demo</title>
   <style>
     body {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; max-width: 920px; margin: 0 auto; padding: 20px; background: #101417; color: #e4eef5; }}
@@ -209,16 +209,16 @@ async fn chat_page(Query(query): Query<ChatPageQuery>) -> Html<String> {
 </head>
 <body>
   <h1>Stripped-down Chat</h1>
-  <p class=\"hint\">Open this page in two tabs or browsers and set different user IDs.</p>
-  <div class=\"row\">
-    <input id=\"user\" value=\"{}\" />
-    <button id=\"connect\">Connect</button>
+  <p class="hint">Open this page in two tabs or browsers and set different user IDs.</p>
+  <div class="row">
+    <input id="user" value="{}" />
+    <button id="connect">Connect</button>
   </div>
-  <div class=\"row\">
-    <input id=\"msg\" placeholder=\"Say something\" />
-    <button id=\"send\">Send</button>
+  <div class="row">
+    <input id="msg" placeholder="Say something" />
+    <button id="send">Send</button>
   </div>
-  <div id=\"log\"></div>
+  <div id="log"></div>
 
 <script>
 const logEl = document.getElementById('log');
