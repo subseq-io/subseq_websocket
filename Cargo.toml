@@ -22,3 +22,8 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 default = ["api"]
 api = ["dep:axum", "dep:bytes", "dep:futures-util", "dep:subseq_auth", "sqlx"]
 sqlx = ["dep:sqlx", "dep:once_cell", "dep:chrono"]
+
+[dev-dependencies]
+axum-server = "0.7.2"
+serde_urlencoded = "0.7.1"
+tracing-subscriber = "0.3.20"

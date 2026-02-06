@@ -1,4 +1,10 @@
 //! Convenience re-exports for implementing websocket services.
+//!
+//! Typical setup:
+//! 1. Implement `HasPool`, `HasWsHub`, and `HandlesWebSocketEvents` on app state.
+//! 2. Mount `routes::<AppState>()` into your axum router.
+//! 3. Ensure `AuthenticatedUser` is inserted into request extensions
+//!    (typically via `subseq_auth` middleware).
 
 #[cfg(feature = "api")]
 pub use crate::api::{

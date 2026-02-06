@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Best-effort metadata captured from websocket upgrade headers.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionMetadata {
@@ -13,11 +14,13 @@ pub struct ConnectionMetadata {
 }
 
 impl ConnectionMetadata {
+    /// Convert metadata into JSON for persistence.
     pub fn as_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
     }
 }
 
+/// Runtime context passed to websocket handlers for each connection.
 #[derive(Debug, Clone)]
 pub struct WsContext {
     pub user_id: Uuid,
@@ -27,6 +30,7 @@ pub struct WsContext {
 }
 
 impl WsContext {
+    /// Build a new handler context.
     pub fn new(
         user_id: Uuid,
         session_id: Uuid,
@@ -43,6 +47,7 @@ impl WsContext {
 }
 
 #[cfg(feature = "sqlx")]
+/// Persistent logical websocket session keyed by `user_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct WsUserSession {
@@ -56,6 +61,7 @@ pub struct WsUserSession {
 }
 
 #[cfg(feature = "sqlx")]
+/// Persistent physical websocket connection row.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct WsConnection {
@@ -69,6 +75,7 @@ pub struct WsConnection {
 }
 
 #[cfg(feature = "sqlx")]
+/// Combined result from opening a websocket connection.
 #[derive(Debug, Clone)]
 pub struct ConnectionLease {
     pub session: WsUserSession,

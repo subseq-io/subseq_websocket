@@ -22,6 +22,10 @@ use crate::db;
 use crate::error::{LibError, Result};
 use crate::models::{ConnectionMetadata, WsContext};
 
+/// In-memory fan-out hub keyed by `user_id` and `connection_id`.
+///
+/// This allows callers to target all active browser tabs for a single user or
+/// broadcast payloads to every connected user.
 #[derive(Clone)]
 pub struct WsHub {
     inner: Arc<RwLock<HashMap<Uuid, HashMap<Uuid, mpsc::UnboundedSender<OutboundMessage>>>>>,
@@ -34,6 +38,7 @@ impl Default for WsHub {
 }
 
 impl WsHub {
+    /// Create an empty websocket hub.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
@@ -61,6 +66,7 @@ impl WsHub {
         }
     }
 
+    /// Serialize and send a JSON payload to all active connections for one user.
     pub async fn send_json_to_user<T: Serialize>(
         &self,
         user_id: Uuid,
@@ -73,16 +79,19 @@ impl WsHub {
             .await)
     }
 
+    /// Send a raw text payload to all active connections for one user.
     pub async fn send_text_to_user(&self, user_id: Uuid, payload: impl Into<String>) -> usize {
         self.send_to_user(user_id, OutboundMessage::Text(payload.into()))
             .await
     }
 
+    /// Send a raw binary payload to all active connections for one user.
     pub async fn send_binary_to_user(&self, user_id: Uuid, payload: Bytes) -> usize {
         self.send_to_user(user_id, OutboundMessage::Binary(payload))
             .await
     }
 
+    /// Serialize and broadcast a JSON payload to all active connections.
     pub async fn broadcast_json<T: Serialize>(&self, payload: &T) -> Result<usize> {
         let text = serde_json::to_string(payload)
             .map_err(|e| LibError::invalid("failed to serialize websocket json payload", e))?;
@@ -131,6 +140,7 @@ impl WsHub {
     }
 }
 
+/// Outbound payload envelope for active websocket connections.
 #[derive(Clone)]
 pub enum OutboundMessage {
     Text(String),
@@ -138,25 +148,38 @@ pub enum OutboundMessage {
     Close,
 }
 
+/// Application state adapter for accessing a shared SQLx pool.
 pub trait HasPool {
     fn pool(&self) -> Arc<PgPool>;
 }
 
+/// Application state adapter for accessing the websocket hub.
 pub trait HasWsHub {
     fn ws_hub(&self) -> WsHub;
 }
 
+/// Typed JSON dispatcher entrypoint.
+///
+/// Implement this on your inbound JSON enum and route each variant to internal
+/// handlers so callers keep a typed boundary as soon as deserialization
+/// succeeds.
 pub trait JsonDispatch<S>: Send + 'static {
     fn dispatch(self, app: &S, context: WsContext) -> impl Future<Output = Result<()>> + Send;
 }
 
+/// Hook points for websocket lifecycle and payload handling.
+///
+/// `IncomingJson` should normally be an internally tagged enum, for example:
+/// `#[serde(tag = "type", rename_all = "snake_case")]`.
 pub trait HandlesWebSocketEvents: Sized + Send + Sync {
     type IncomingJson: DeserializeOwned + JsonDispatch<Self> + Send + 'static;
 
+    /// Called once after a websocket has been registered.
     fn on_connect(&self, _context: WsContext) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
 
+    /// Called for every incoming binary frame.
     fn on_binary(
         &self,
         _context: WsContext,
@@ -165,11 +188,13 @@ pub trait HandlesWebSocketEvents: Sized + Send + Sync {
         async { Ok(()) }
     }
 
+    /// Called once after websocket shutdown and unregistration.
     fn on_disconnect(&self, _context: WsContext) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
 }
 
+/// Required capabilities for mounting websocket routes.
 pub trait WsApp:
     HasPool + HasWsHub + ValidatesIdentity + HandlesWebSocketEvents + Clone + Send + Sync + 'static
 {
@@ -378,6 +403,13 @@ where
     }
 }
 
+/// Build websocket routes for this library.
+///
+/// Exposes:
+/// - `GET /ws`
+///
+/// The route requires `AuthenticatedUser` to be present in request extensions,
+/// matching the `subseq_auth` gating model.
 pub fn routes<S>() -> Router<S>
 where
     S: WsApp,

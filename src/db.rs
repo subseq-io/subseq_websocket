@@ -7,16 +7,22 @@ use uuid::Uuid;
 use crate::error::{LibError, Result};
 use crate::models::{ConnectionLease, ConnectionMetadata, WsConnection, WsUserSession};
 
+/// SQLx migrator for websocket session tables.
 pub static MIGRATOR: Lazy<Migrator> = Lazy::new(|| {
     let mut migrator = sqlx::migrate!("./migrations");
     migrator.set_ignore_missing(true);
     migrator
 });
 
+/// Create or upgrade websocket persistence tables.
 pub async fn create_websocket_tables(pool: &PgPool) -> core::result::Result<(), MigrateError> {
     MIGRATOR.run(pool).await
 }
 
+/// Open or resume a user-level websocket session and register a new connection.
+///
+/// Session rows are keyed by `user_id`, allowing multiple tabs to share one
+/// logical session while still tracking each physical connection separately.
 pub async fn open_connection(
     pool: &PgPool,
     user_id: Uuid,
@@ -97,6 +103,7 @@ pub async fn open_connection(
     })
 }
 
+/// Refresh heartbeat timestamps for an active connection.
 pub async fn touch_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> {
     sqlx::query(
         r#"
@@ -119,6 +126,8 @@ pub async fn touch_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> 
     Ok(())
 }
 
+/// Mark a connection closed and update user-session disconnect state when
+/// the final active connection for that user goes away.
 pub async fn close_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> {
     let mut tx = pool
         .begin()
@@ -183,6 +192,7 @@ pub async fn close_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> 
     Ok(())
 }
 
+/// Count currently active (not disconnected) websocket connections for a user.
 pub async fn active_connection_count(pool: &PgPool, user_id: Uuid) -> Result<i64> {
     sqlx::query_scalar::<_, i64>(
         r#"
@@ -197,6 +207,7 @@ pub async fn active_connection_count(pool: &PgPool, user_id: Uuid) -> Result<i64
     .map_err(|e| LibError::database("failed to count active websocket connections", e))
 }
 
+/// Fetch the current logical websocket session row for a user.
 pub async fn get_user_session(pool: &PgPool, user_id: Uuid) -> Result<Option<WsUserSession>> {
     sqlx::query_as::<_, WsUserSession>(
         r#"
