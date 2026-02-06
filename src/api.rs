@@ -204,13 +204,6 @@ where
     })
 }
 
-pub fn routes<S>() -> Router<S>
-where
-    S: WsApp,
-{
-    Router::new().route("/ws", get(ws_handler::<S>))
-}
-
 async fn run_socket<S>(app: S, socket: WebSocket, user_id: Uuid, metadata: ConnectionMetadata)
 where
     S: WsApp,
@@ -274,6 +267,13 @@ where
         match message {
             Message::Text(text) => {
                 let text = text.to_string();
+                if let Some(reply) = keepalive_reply_for_text(&text) {
+                    if tx.send(OutboundMessage::Text(reply)).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
                 match serde_json::from_str::<S::IncomingJson>(&text) {
                     Ok(json_message) => {
                         if let Err(err) = json_message.dispatch(&app, context.clone()).await {
@@ -375,5 +375,63 @@ where
 {
     fn from_ref(input: &S) -> Self {
         input.ws_hub()
+    }
+}
+
+pub fn routes<S>() -> Router<S>
+where
+    S: WsApp,
+{
+    Router::new().route("/ws", get(ws_handler::<S>))
+}
+
+fn keepalive_reply_for_text(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+
+    if trimmed.eq_ignore_ascii_case("PING") {
+        return Some("PONG".to_string());
+    }
+
+    let (verb, rest) = trimmed.split_once(char::is_whitespace)?;
+    if verb.eq_ignore_ascii_case("PING") {
+        if rest.trim().is_empty() {
+            Some("PONG".to_string())
+        } else {
+            Some(format!("PONG {}", rest.trim()))
+        }
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keepalive_reply_for_text;
+
+    #[test]
+    fn keepalive_basic_ping() {
+        assert_eq!(keepalive_reply_for_text("PING"), Some("PONG".to_string()));
+    }
+
+    #[test]
+    fn keepalive_is_case_insensitive_and_trimmed() {
+        assert_eq!(
+            keepalive_reply_for_text("  ping  "),
+            Some("PONG".to_string())
+        );
+    }
+
+    #[test]
+    fn keepalive_forwards_suffix_payload() {
+        assert_eq!(
+            keepalive_reply_for_text("PING 1678901234"),
+            Some("PONG 1678901234".to_string())
+        );
+    }
+
+    #[test]
+    fn non_keepalive_text_is_not_handled() {
+        assert_eq!(keepalive_reply_for_text("{\"type\":\"PING\"}"), None);
+        assert_eq!(keepalive_reply_for_text("PONG"), None);
     }
 }
