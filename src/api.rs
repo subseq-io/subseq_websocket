@@ -14,7 +14,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
-use subseq_auth::prelude::{AuthenticatedUser, ValidatesIdentity};
+use subseq_auth::prelude::{MaybeAuthenticatedUser, ValidatesIdentity};
+use subseq_auth::user_id::UserId;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
@@ -22,13 +23,19 @@ use crate::db;
 use crate::error::{LibError, Result};
 use crate::models::{ConnectionMetadata, WsContext};
 
-/// In-memory fan-out hub keyed by `user_id` and `connection_id`.
+/// In-memory fan-out hub keyed by active sessions and optionally by user.
 ///
-/// This allows callers to target all active browser tabs for a single user or
-/// broadcast payloads to every connected user.
+/// - Session fan-out supports unauthenticated receive-only clients.
+/// - User fan-out supports merged multi-tab behavior for authenticated users.
 #[derive(Clone)]
 pub struct WsHub {
-    inner: Arc<RwLock<HashMap<Uuid, HashMap<Uuid, mpsc::UnboundedSender<OutboundMessage>>>>>,
+    inner: Arc<RwLock<HubState>>,
+}
+
+#[derive(Default)]
+struct HubState {
+    users: HashMap<Uuid, HashMap<Uuid, mpsc::UnboundedSender<OutboundMessage>>>,
+    sessions: HashMap<Uuid, HashMap<Uuid, mpsc::UnboundedSender<OutboundMessage>>>,
 }
 
 impl Default for WsHub {
@@ -41,29 +48,78 @@ impl WsHub {
     /// Create an empty websocket hub.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(HubState::default())),
         }
     }
 
+    /// Register a new connection under its session and optional user identity.
     pub async fn register(
         &self,
-        user_id: Uuid,
+        user_id: Option<UserId>,
+        session_id: Uuid,
         connection_id: Uuid,
         tx: mpsc::UnboundedSender<OutboundMessage>,
     ) {
         let mut guard = self.inner.write().await;
-        let user_map = guard.entry(user_id).or_default();
-        user_map.insert(connection_id, tx);
+
+        guard
+            .sessions
+            .entry(session_id)
+            .or_default()
+            .insert(connection_id, tx.clone());
+
+        if let Some(user_id) = user_id {
+            guard
+                .users
+                .entry(user_id.0)
+                .or_default()
+                .insert(connection_id, tx);
+        }
     }
 
-    pub async fn unregister(&self, user_id: Uuid, connection_id: Uuid) {
+    /// Unregister a connection from all fan-out indexes.
+    pub async fn unregister(&self, user_id: Option<UserId>, session_id: Uuid, connection_id: Uuid) {
         let mut guard = self.inner.write().await;
-        if let Some(user_map) = guard.get_mut(&user_id) {
-            user_map.remove(&connection_id);
-            if user_map.is_empty() {
-                guard.remove(&user_id);
+
+        if let Some(session_map) = guard.sessions.get_mut(&session_id) {
+            session_map.remove(&connection_id);
+            if session_map.is_empty() {
+                guard.sessions.remove(&session_id);
             }
         }
+
+        if let Some(user_id) = user_id {
+            if let Some(user_map) = guard.users.get_mut(&user_id.0) {
+                user_map.remove(&connection_id);
+                if user_map.is_empty() {
+                    guard.users.remove(&user_id.0);
+                }
+            }
+        }
+    }
+
+    /// Move session-indexed connections into a user fan-out group.
+    ///
+    /// Call this after persisting auth state if a previously anonymous session
+    /// should now be addressable by `user_id`.
+    pub async fn associate_user_with_session(&self, session_id: Uuid, user_id: Uuid) -> usize {
+        let mut guard = self.inner.write().await;
+
+        let Some(session_map) = guard.sessions.get(&session_id) else {
+            return 0;
+        };
+        let session_map = session_map.clone();
+
+        let user_map = guard.users.entry(user_id).or_default();
+        let mut linked = 0;
+
+        for (connection_id, tx) in session_map {
+            if user_map.insert(connection_id, tx).is_none() {
+                linked += 1;
+            }
+        }
+
+        linked
     }
 
     /// Serialize and send a JSON payload to all active connections for one user.
@@ -91,6 +147,35 @@ impl WsHub {
             .await
     }
 
+    /// Serialize and send a JSON payload to all active connections for one session.
+    pub async fn send_json_to_session<T: Serialize>(
+        &self,
+        session_id: Uuid,
+        payload: &T,
+    ) -> Result<usize> {
+        let text = serde_json::to_string(payload)
+            .map_err(|e| LibError::invalid("failed to serialize websocket json payload", e))?;
+        Ok(self
+            .send_to_session(session_id, OutboundMessage::Text(text))
+            .await)
+    }
+
+    /// Send a raw text payload to all active connections for one session.
+    pub async fn send_text_to_session(
+        &self,
+        session_id: Uuid,
+        payload: impl Into<String>,
+    ) -> usize {
+        self.send_to_session(session_id, OutboundMessage::Text(payload.into()))
+            .await
+    }
+
+    /// Send a raw binary payload to all active connections for one session.
+    pub async fn send_binary_to_session(&self, session_id: Uuid, payload: Bytes) -> usize {
+        self.send_to_session(session_id, OutboundMessage::Binary(payload))
+            .await
+    }
+
     /// Serialize and broadcast a JSON payload to all active connections.
     pub async fn broadcast_json<T: Serialize>(&self, payload: &T) -> Result<usize> {
         let text = serde_json::to_string(payload)
@@ -102,7 +187,7 @@ impl WsHub {
         let mut guard = self.inner.write().await;
         let mut delivered = 0;
 
-        if let Some(user_map) = guard.get_mut(&user_id) {
+        if let Some(user_map) = guard.users.get_mut(&user_id) {
             user_map.retain(|_, tx| {
                 if tx.send(payload.clone()).is_ok() {
                     delivered += 1;
@@ -113,7 +198,29 @@ impl WsHub {
             });
 
             if user_map.is_empty() {
-                guard.remove(&user_id);
+                guard.users.remove(&user_id);
+            }
+        }
+
+        delivered
+    }
+
+    async fn send_to_session(&self, session_id: Uuid, payload: OutboundMessage) -> usize {
+        let mut guard = self.inner.write().await;
+        let mut delivered = 0;
+
+        if let Some(session_map) = guard.sessions.get_mut(&session_id) {
+            session_map.retain(|_, tx| {
+                if tx.send(payload.clone()).is_ok() {
+                    delivered += 1;
+                    true
+                } else {
+                    false
+                }
+            });
+
+            if session_map.is_empty() {
+                guard.sessions.remove(&session_id);
             }
         }
 
@@ -124,8 +231,8 @@ impl WsHub {
         let mut guard = self.inner.write().await;
         let mut delivered = 0;
 
-        guard.retain(|_, user_map| {
-            user_map.retain(|_, tx| {
+        guard.sessions.retain(|_, session_map| {
+            session_map.retain(|_, tx| {
                 if tx.send(payload.clone()).is_ok() {
                     delivered += 1;
                     true
@@ -133,8 +240,11 @@ impl WsHub {
                     false
                 }
             });
-            !user_map.is_empty()
+
+            !session_map.is_empty()
         });
+
+        guard.users.retain(|_, user_map| !user_map.is_empty());
 
         delivered
     }
@@ -179,7 +289,7 @@ pub trait HandlesWebSocketEvents: Sized + Send + Sync {
         async { Ok(()) }
     }
 
-    /// Called for every incoming binary frame.
+    /// Called for every incoming binary frame from authenticated clients.
     fn on_binary(
         &self,
         _context: WsContext,
@@ -215,13 +325,13 @@ impl<T> WsApp for T where
 async fn ws_handler<S>(
     ws: WebSocketUpgrade,
     State(app): State<S>,
-    auth_user: AuthenticatedUser,
+    auth_user: MaybeAuthenticatedUser,
     headers: HeaderMap,
 ) -> impl IntoResponse
 where
     S: WsApp,
 {
-    let user_id = auth_user.id().0;
+    let user_id = auth_user.0.map(|u| u.id());
     let metadata = metadata_from_headers(&headers);
 
     ws.on_upgrade(move |socket| async move {
@@ -229,15 +339,23 @@ where
     })
 }
 
-async fn run_socket<S>(app: S, socket: WebSocket, user_id: Uuid, metadata: ConnectionMetadata)
-where
+async fn run_socket<S>(
+    app: S,
+    socket: WebSocket,
+    user_id: Option<UserId>,
+    metadata: ConnectionMetadata,
+) where
     S: WsApp,
 {
     let pool = app.pool();
+    let user_tag = user_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "anonymous".to_string());
+
     let lease = match db::open_connection(pool.as_ref(), user_id, &metadata).await {
         Ok(lease) => lease,
         Err(err) => {
-            tracing::error!(user_id = %user_id, error = %err, "failed to open websocket connection");
+            tracing::error!(user_id = %user_tag, error = %err, "failed to open websocket connection");
             return;
         }
     };
@@ -251,12 +369,18 @@ where
 
     let (tx, rx) = mpsc::unbounded_channel();
     let hub = app.ws_hub();
-    hub.register(user_id, lease.connection.connection_id, tx.clone())
-        .await;
+    hub.register(
+        user_id,
+        lease.session.session_id,
+        lease.connection.connection_id,
+        tx.clone(),
+    )
+    .await;
 
     if let Err(err) = app.on_connect(context.clone()).await {
         tracing::warn!(
-            user_id = %user_id,
+            user_id = %user_tag,
+            session_id = %lease.session.session_id,
             connection_id = %lease.connection.connection_id,
             error = %err,
             "websocket on_connect failed"
@@ -271,7 +395,8 @@ where
             Ok(message) => message,
             Err(err) => {
                 tracing::warn!(
-                    user_id = %user_id,
+                    user_id = %user_tag,
+                    session_id = %lease.session.session_id,
                     connection_id = %lease.connection.connection_id,
                     error = %err,
                     "websocket receive error"
@@ -299,11 +424,24 @@ where
                     continue;
                 }
 
+                if user_id.is_none() {
+                    if !reject_unauthorized_incoming(
+                        &tx,
+                        lease.session.session_id,
+                        lease.connection.connection_id,
+                        "text",
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+
                 match serde_json::from_str::<S::IncomingJson>(&text) {
                     Ok(json_message) => {
                         if let Err(err) = json_message.dispatch(&app, context.clone()).await {
                             tracing::warn!(
-                                user_id = %user_id,
+                                user_id = %user_tag,
+                                session_id = %lease.session.session_id,
                                 connection_id = %lease.connection.connection_id,
                                 error = %err,
                                 "websocket json dispatch failed"
@@ -312,7 +450,8 @@ where
                     }
                     Err(err) => {
                         tracing::warn!(
-                            user_id = %user_id,
+                            user_id = %user_tag,
+                            session_id = %lease.session.session_id,
                             connection_id = %lease.connection.connection_id,
                             error = %err,
                             "failed to deserialize websocket json message"
@@ -321,9 +460,22 @@ where
                 }
             }
             Message::Binary(payload) => {
+                if user_id.is_none() {
+                    if !reject_unauthorized_incoming(
+                        &tx,
+                        lease.session.session_id,
+                        lease.connection.connection_id,
+                        "binary",
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+
                 if let Err(err) = app.on_binary(context.clone(), payload).await {
                     tracing::warn!(
-                        user_id = %user_id,
+                        user_id = %user_tag,
+                        session_id = %lease.session.session_id,
                         connection_id = %lease.connection.connection_id,
                         error = %err,
                         "websocket binary handler failed"
@@ -335,15 +487,20 @@ where
         }
     }
 
-    hub.unregister(user_id, lease.connection.connection_id)
-        .await;
+    hub.unregister(
+        user_id,
+        lease.session.session_id,
+        lease.connection.connection_id,
+    )
+    .await;
     let _ = tx.send(OutboundMessage::Close);
     drop(tx);
     let _ = writer.await;
 
     if let Err(err) = app.on_disconnect(context.clone()).await {
         tracing::warn!(
-            user_id = %user_id,
+            user_id = %user_tag,
+            session_id = %lease.session.session_id,
             connection_id = %lease.connection.connection_id,
             error = %err,
             "websocket on_disconnect failed"
@@ -352,12 +509,29 @@ where
 
     if let Err(err) = db::close_connection(pool.as_ref(), lease.connection.connection_id).await {
         tracing::warn!(
-            user_id = %user_id,
+            user_id = %user_tag,
+            session_id = %lease.session.session_id,
             connection_id = %lease.connection.connection_id,
             error = %err,
             "failed to close websocket connection"
         );
     }
+}
+
+fn reject_unauthorized_incoming(
+    tx: &mpsc::UnboundedSender<OutboundMessage>,
+    session_id: Uuid,
+    connection_id: Uuid,
+    message_kind: &'static str,
+) -> bool {
+    tracing::debug!(
+        session_id = %session_id,
+        connection_id = %connection_id,
+        message_kind,
+        "rejecting websocket payload from unauthenticated connection"
+    );
+    tx.send(OutboundMessage::Text("UNAUTHORIZED".to_string()))
+        .is_ok()
 }
 
 async fn write_outbound_loop(
@@ -408,8 +582,9 @@ where
 /// Exposes:
 /// - `GET /ws`
 ///
-/// The route requires `AuthenticatedUser` to be present in request extensions,
-/// matching the `subseq_auth` gating model.
+/// `AuthenticatedUser` is optional. Unauthenticated sockets are accepted but
+/// treated as receive-only; incoming text/binary payloads (except keepalive
+/// `PING`) are rejected.
 pub fn routes<S>() -> Router<S>
 where
     S: WsApp,

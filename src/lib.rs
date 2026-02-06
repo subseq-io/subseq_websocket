@@ -2,6 +2,7 @@
 //!
 //! Highlights:
 //! - One authenticated websocket route at `GET /ws`.
+//! - Optional anonymous sockets with receive-only semantics.
 //! - Typed JSON dispatch via your own enum + `JsonDispatch`.
 //! - Raw binary hook for protocol-specific payloads.
 //! - SQLx session/connection tracking that merges multiple tabs by `user_id`.

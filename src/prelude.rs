@@ -3,8 +3,8 @@
 //! Typical setup:
 //! 1. Implement `HasPool`, `HasWsHub`, and `HandlesWebSocketEvents` on app state.
 //! 2. Mount `routes::<AppState>()` into your axum router.
-//! 3. Ensure `AuthenticatedUser` is inserted into request extensions
-//!    (typically via `subseq_auth` middleware).
+//! 3. Optionally insert `AuthenticatedUser` into request extensions
+//!    (typically via `subseq_auth` middleware) to allow inbound writes.
 
 #[cfg(feature = "api")]
 pub use crate::api::{
@@ -13,8 +13,8 @@ pub use crate::api::{
 
 #[cfg(feature = "sqlx")]
 pub use crate::db::{
-    active_connection_count, close_connection, create_websocket_tables, get_user_session,
-    open_connection, touch_connection,
+    active_connection_count, active_connection_count_for_session, associate_user_with_session,
+    close_connection, create_websocket_tables, get_user_session, open_connection, touch_connection,
 };
 
 pub use crate::error::{ErrorKind, LibError, Result};

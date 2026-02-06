@@ -1,8 +1,8 @@
 CREATE SCHEMA IF NOT EXISTS websocket;
 
 CREATE TABLE IF NOT EXISTS websocket.user_sessions (
-    user_id UUID PRIMARY KEY,
-    session_id UUID NOT NULL UNIQUE,
+    session_id UUID PRIMARY KEY,
+    user_id UUID UNIQUE REFERENCES auth.users(id) ON DELETE CASCADE,
     connected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     disconnected_at TIMESTAMPTZ,
@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS websocket.user_sessions (
 
 CREATE TABLE IF NOT EXISTS websocket.connections (
     connection_id UUID PRIMARY KEY,
-    user_id UUID NOT NULL,
-    session_id UUID NOT NULL,
+    user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+    session_id UUID NOT NULL REFERENCES websocket.user_sessions(session_id) ON DELETE CASCADE,
     connected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     disconnected_at TIMESTAMPTZ,
@@ -31,3 +31,6 @@ CREATE INDEX IF NOT EXISTS idx_ws_connections_disconnected_at
 
 CREATE INDEX IF NOT EXISTS idx_ws_user_sessions_last_seen
     ON websocket.user_sessions (last_seen_at);
+
+CREATE INDEX IF NOT EXISTS idx_ws_user_sessions_user_id
+    ON websocket.user_sessions (user_id);

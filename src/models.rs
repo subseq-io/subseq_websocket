@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use subseq_auth::user_id::UserId;
 use uuid::Uuid;
 
 /// Best-effort metadata captured from websocket upgrade headers.
@@ -23,7 +24,7 @@ impl ConnectionMetadata {
 /// Runtime context passed to websocket handlers for each connection.
 #[derive(Debug, Clone)]
 pub struct WsContext {
-    pub user_id: Uuid,
+    pub user_id: Option<UserId>,
     pub session_id: Uuid,
     pub connection_id: Uuid,
     pub metadata: ConnectionMetadata,
@@ -32,7 +33,7 @@ pub struct WsContext {
 impl WsContext {
     /// Build a new handler context.
     pub fn new(
-        user_id: Uuid,
+        user_id: Option<UserId>,
         session_id: Uuid,
         connection_id: Uuid,
         metadata: ConnectionMetadata,
@@ -47,12 +48,14 @@ impl WsContext {
 }
 
 #[cfg(feature = "sqlx")]
-/// Persistent logical websocket session keyed by `user_id`.
+/// Persistent logical websocket session.
+///
+/// Anonymous sessions have `user_id = None`.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct WsUserSession {
-    pub user_id: Uuid,
     pub session_id: Uuid,
+    pub user_id: Option<Uuid>,
     pub connected_at: chrono::DateTime<chrono::Utc>,
     pub last_seen_at: chrono::DateTime<chrono::Utc>,
     pub disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -66,7 +69,7 @@ pub struct WsUserSession {
 #[serde(rename_all = "camelCase")]
 pub struct WsConnection {
     pub connection_id: Uuid,
-    pub user_id: Uuid,
+    pub user_id: Option<Uuid>,
     pub session_id: Uuid,
     pub connected_at: chrono::DateTime<chrono::Utc>,
     pub last_seen_at: chrono::DateTime<chrono::Utc>,
