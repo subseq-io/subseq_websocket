@@ -5,8 +5,9 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRef, State};
-use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use futures_util::stream::SplitSink;
@@ -20,8 +21,11 @@ use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::db;
-use crate::error::{LibError, Result};
+use crate::error::{ErrorKind, LibError, Result};
 use crate::models::{ConnectionMetadata, WsContext};
+
+const WS_SESSION_COOKIE: &str = "subseq_ws_session";
+const DEFAULT_ANON_SESSION_TTL_SECONDS: i64 = 300;
 
 /// In-memory fan-out hub keyed by active sessions and optionally by user.
 ///
@@ -327,23 +331,101 @@ async fn ws_handler<S>(
     State(app): State<S>,
     auth_user: MaybeAuthenticatedUser,
     headers: HeaderMap,
-) -> impl IntoResponse
+) -> Response
 where
     S: WsApp,
 {
     let user_id = auth_user.0.map(|u| u.id());
     let metadata = metadata_from_headers(&headers);
+    let anonymous_session_ttl_seconds = anonymous_session_ttl_seconds();
+    let requested_session_id = session_id_from_cookie(&headers);
 
-    ws.on_upgrade(move |socket| async move {
-        run_socket(app, socket, user_id, metadata).await;
-    })
+    if let (Some(user_id), Some(session_id)) = (user_id, requested_session_id) {
+        match db::associate_user_with_session(app.pool().as_ref(), session_id, user_id).await {
+            Ok(_) => {
+                let linked = app
+                    .ws_hub()
+                    .associate_user_with_session(session_id, user_id.0)
+                    .await;
+                tracing::debug!(
+                    user_id = %user_id,
+                    session_id = %session_id,
+                    linked,
+                    "associated websocket session with authenticated user"
+                );
+            }
+            Err(err) if matches!(err.kind, ErrorKind::NotFound) => {}
+            Err(err) => {
+                tracing::warn!(
+                    user_id = %user_id,
+                    session_id = %session_id,
+                    error = %err,
+                    "failed to associate websocket session with authenticated user"
+                );
+            }
+        }
+    }
+
+    let session = match db::open_or_resume_session(
+        app.pool().as_ref(),
+        user_id,
+        if user_id.is_none() {
+            requested_session_id
+        } else {
+            None
+        },
+        &metadata,
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(err) => {
+            tracing::error!(
+                user_id = %user_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "anonymous".to_string()),
+                error = %err,
+                "failed to open websocket session"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "websocket session setup failed",
+            )
+                .into_response();
+        }
+    };
+
+    let mut response = ws
+        .on_upgrade(move |socket| async move {
+            run_socket(
+                app,
+                socket,
+                user_id,
+                session.session_id,
+                metadata,
+                anonymous_session_ttl_seconds,
+            )
+            .await;
+        })
+        .into_response();
+
+    if let Ok(set_cookie) = HeaderValue::from_str(&session_cookie_header_value(
+        session.session_id,
+        anonymous_session_ttl_seconds,
+    )) {
+        response.headers_mut().append(SET_COOKIE, set_cookie);
+    }
+
+    response
 }
 
 async fn run_socket<S>(
     app: S,
     socket: WebSocket,
     user_id: Option<UserId>,
+    session_id: Uuid,
     metadata: ConnectionMetadata,
+    anonymous_session_ttl_seconds: i64,
 ) where
     S: WsApp,
 {
@@ -352,36 +434,32 @@ async fn run_socket<S>(
         .map(|id| id.to_string())
         .unwrap_or_else(|| "anonymous".to_string());
 
-    let lease = match db::open_connection(pool.as_ref(), user_id, &metadata).await {
-        Ok(lease) => lease,
-        Err(err) => {
-            tracing::error!(user_id = %user_tag, error = %err, "failed to open websocket connection");
-            return;
-        }
-    };
+    let connection =
+        match db::register_connection(pool.as_ref(), session_id, user_id, &metadata).await {
+            Ok(connection) => connection,
+            Err(err) => {
+                tracing::error!(
+                    user_id = %user_tag,
+                    session_id = %session_id,
+                    error = %err,
+                    "failed to register websocket connection"
+                );
+                return;
+            }
+        };
 
-    let context = WsContext::new(
-        user_id,
-        lease.session.session_id,
-        lease.connection.connection_id,
-        metadata,
-    );
+    let context = WsContext::new(user_id, session_id, connection.connection_id, metadata);
 
     let (tx, rx) = mpsc::unbounded_channel();
     let hub = app.ws_hub();
-    hub.register(
-        user_id,
-        lease.session.session_id,
-        lease.connection.connection_id,
-        tx.clone(),
-    )
-    .await;
+    hub.register(user_id, session_id, connection.connection_id, tx.clone())
+        .await;
 
     if let Err(err) = app.on_connect(context.clone()).await {
         tracing::warn!(
             user_id = %user_tag,
-            session_id = %lease.session.session_id,
-            connection_id = %lease.connection.connection_id,
+            session_id = %session_id,
+            connection_id = %connection.connection_id,
             error = %err,
             "websocket on_connect failed"
         );
@@ -396,8 +474,8 @@ async fn run_socket<S>(
             Err(err) => {
                 tracing::warn!(
                     user_id = %user_tag,
-                    session_id = %lease.session.session_id,
-                    connection_id = %lease.connection.connection_id,
+                    session_id = %session_id,
+                    connection_id = %connection.connection_id,
                     error = %err,
                     "websocket receive error"
                 );
@@ -405,10 +483,9 @@ async fn run_socket<S>(
             }
         };
 
-        if let Err(err) = db::touch_connection(pool.as_ref(), lease.connection.connection_id).await
-        {
+        if let Err(err) = db::touch_connection(pool.as_ref(), connection.connection_id).await {
             tracing::debug!(
-                connection_id = %lease.connection.connection_id,
+                connection_id = %connection.connection_id,
                 error = %err,
                 "failed to update websocket heartbeat"
             );
@@ -427,8 +504,8 @@ async fn run_socket<S>(
                 if user_id.is_none() {
                     if !reject_unauthorized_incoming(
                         &tx,
-                        lease.session.session_id,
-                        lease.connection.connection_id,
+                        session_id,
+                        connection.connection_id,
                         "text",
                     ) {
                         break;
@@ -441,8 +518,8 @@ async fn run_socket<S>(
                         if let Err(err) = json_message.dispatch(&app, context.clone()).await {
                             tracing::warn!(
                                 user_id = %user_tag,
-                                session_id = %lease.session.session_id,
-                                connection_id = %lease.connection.connection_id,
+                                session_id = %session_id,
+                                connection_id = %connection.connection_id,
                                 error = %err,
                                 "websocket json dispatch failed"
                             );
@@ -451,8 +528,8 @@ async fn run_socket<S>(
                     Err(err) => {
                         tracing::warn!(
                             user_id = %user_tag,
-                            session_id = %lease.session.session_id,
-                            connection_id = %lease.connection.connection_id,
+                            session_id = %session_id,
+                            connection_id = %connection.connection_id,
                             error = %err,
                             "failed to deserialize websocket json message"
                         );
@@ -463,8 +540,8 @@ async fn run_socket<S>(
                 if user_id.is_none() {
                     if !reject_unauthorized_incoming(
                         &tx,
-                        lease.session.session_id,
-                        lease.connection.connection_id,
+                        session_id,
+                        connection.connection_id,
                         "binary",
                     ) {
                         break;
@@ -475,8 +552,8 @@ async fn run_socket<S>(
                 if let Err(err) = app.on_binary(context.clone(), payload).await {
                     tracing::warn!(
                         user_id = %user_tag,
-                        session_id = %lease.session.session_id,
-                        connection_id = %lease.connection.connection_id,
+                        session_id = %session_id,
+                        connection_id = %connection.connection_id,
                         error = %err,
                         "websocket binary handler failed"
                     );
@@ -487,12 +564,8 @@ async fn run_socket<S>(
         }
     }
 
-    hub.unregister(
-        user_id,
-        lease.session.session_id,
-        lease.connection.connection_id,
-    )
-    .await;
+    hub.unregister(user_id, session_id, connection.connection_id)
+        .await;
     let _ = tx.send(OutboundMessage::Close);
     drop(tx);
     let _ = writer.await;
@@ -500,18 +573,24 @@ async fn run_socket<S>(
     if let Err(err) = app.on_disconnect(context.clone()).await {
         tracing::warn!(
             user_id = %user_tag,
-            session_id = %lease.session.session_id,
-            connection_id = %lease.connection.connection_id,
+            session_id = %session_id,
+            connection_id = %connection.connection_id,
             error = %err,
             "websocket on_disconnect failed"
         );
     }
 
-    if let Err(err) = db::close_connection(pool.as_ref(), lease.connection.connection_id).await {
+    if let Err(err) = db::close_connection(
+        pool.as_ref(),
+        connection.connection_id,
+        anonymous_session_ttl_seconds,
+    )
+    .await
+    {
         tracing::warn!(
             user_id = %user_tag,
-            session_id = %lease.session.session_id,
-            connection_id = %lease.connection.connection_id,
+            session_id = %session_id,
+            connection_id = %connection.connection_id,
             error = %err,
             "failed to close websocket connection"
         );
@@ -568,6 +647,39 @@ fn metadata_from_headers(headers: &HeaderMap) -> ConnectionMetadata {
     }
 }
 
+fn session_id_from_cookie(headers: &HeaderMap) -> Option<Uuid> {
+    for cookie_header in headers.get_all(COOKIE) {
+        let raw_cookie = cookie_header.to_str().ok()?;
+        for pair in raw_cookie.split(';') {
+            let pair = pair.trim();
+            let (name, value) = pair.split_once('=')?;
+            if name == WS_SESSION_COOKIE {
+                if let Ok(session_id) = Uuid::parse_str(value) {
+                    return Some(session_id);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn session_cookie_header_value(session_id: Uuid, anonymous_session_ttl_seconds: i64) -> String {
+    let ttl = anonymous_session_ttl_seconds.max(1);
+    format!(
+        "{name}={value}; Path=/; Max-Age={ttl}; HttpOnly; SameSite=Lax",
+        name = WS_SESSION_COOKIE,
+        value = session_id
+    )
+}
+
+fn anonymous_session_ttl_seconds() -> i64 {
+    std::env::var("WS_ANON_SESSION_TTL_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|ttl| *ttl > 0)
+        .unwrap_or(DEFAULT_ANON_SESSION_TTL_SECONDS)
+}
+
 impl<S> FromRef<S> for WsHub
 where
     S: HasWsHub,
@@ -585,6 +697,12 @@ where
 /// `AuthenticatedUser` is optional. Unauthenticated sockets are accepted but
 /// treated as receive-only; incoming text/binary payloads (except keepalive
 /// `PING`) are rejected.
+///
+/// The server sets `subseq_ws_session` as an HTTP-only cookie. Anonymous
+/// sessions use this cookie for reconnect continuity and can be reclaimed by an
+/// authenticated user if `associate_user_with_session` is called before expiry.
+///
+/// Anonymous TTL can be configured with `WS_ANON_SESSION_TTL_SECONDS`.
 pub fn routes<S>() -> Router<S>
 where
     S: WsApp,

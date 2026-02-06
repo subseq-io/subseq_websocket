@@ -14,7 +14,8 @@ pub use crate::api::{
 #[cfg(feature = "sqlx")]
 pub use crate::db::{
     active_connection_count, active_connection_count_for_session, associate_user_with_session,
-    close_connection, create_websocket_tables, get_user_session, open_connection, touch_connection,
+    close_connection, create_websocket_tables, get_user_session, open_or_resume_session,
+    purge_expired_anonymous_sessions, register_connection, touch_connection,
 };
 
 pub use crate::error::{ErrorKind, LibError, Result};

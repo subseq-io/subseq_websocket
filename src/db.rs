@@ -6,7 +6,7 @@ use subseq_auth::user_id::UserId;
 use uuid::Uuid;
 
 use crate::error::{LibError, Result};
-use crate::models::{ConnectionLease, ConnectionMetadata, WsConnection, WsUserSession};
+use crate::models::{ConnectionMetadata, WsConnection, WsUserSession};
 
 /// SQLx migrator for websocket session tables.
 pub static MIGRATOR: Lazy<Migrator> = Lazy::new(|| {
@@ -20,57 +20,73 @@ pub async fn create_websocket_tables(pool: &PgPool) -> core::result::Result<(), 
     MIGRATOR.run(pool).await
 }
 
-/// Open or resume a websocket session and register a new connection.
+/// Open or resume a websocket session.
 ///
 /// - Authenticated sessions (`Some(user_id)`) are merged by `user_id`.
-/// - Anonymous sessions (`None`) are always created with a fresh `session_id`.
-pub async fn open_connection(
+/// - Anonymous sessions (`None`) can be resumed by `session_id` if still valid.
+pub async fn open_or_resume_session(
     pool: &PgPool,
     user_id: Option<UserId>,
+    requested_session_id: Option<Uuid>,
     metadata: &ConnectionMetadata,
-) -> Result<ConnectionLease> {
+) -> Result<WsUserSession> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| LibError::database("failed to begin websocket transaction", e))?;
 
-    let next_session_id = Uuid::new_v4();
+    purge_expired_anonymous_sessions_tx(&mut tx).await?;
+
+    let metadata_json = metadata.as_json();
+    let session = match user_id {
+        Some(user_id) => upsert_user_session_tx(&mut tx, user_id, metadata_json)
+            .await
+            .map_err(|e| LibError::database("failed to open authenticated websocket session", e))?,
+        None => {
+            if let Some(session_id) = requested_session_id {
+                if let Some(session) =
+                    resume_anonymous_session_tx(&mut tx, session_id, &metadata_json)
+                        .await
+                        .map_err(|e| {
+                            LibError::database("failed to resume anonymous websocket session", e)
+                        })?
+                {
+                    session
+                } else {
+                    create_anonymous_session_tx(&mut tx, metadata_json)
+                        .await
+                        .map_err(|e| {
+                            LibError::database("failed to create anonymous websocket session", e)
+                        })?
+                }
+            } else {
+                create_anonymous_session_tx(&mut tx, metadata_json)
+                    .await
+                    .map_err(|e| {
+                        LibError::database("failed to create anonymous websocket session", e)
+                    })?
+            }
+        }
+    };
+
+    tx.commit()
+        .await
+        .map_err(|e| LibError::database("failed to commit websocket open transaction", e))?;
+
+    Ok(session)
+}
+
+/// Register a physical websocket connection for a session.
+pub async fn register_connection(
+    pool: &PgPool,
+    session_id: Uuid,
+    user_id: Option<UserId>,
+    metadata: &ConnectionMetadata,
+) -> Result<WsConnection> {
+    let connection_id = Uuid::new_v4();
     let metadata_json = metadata.as_json();
 
-    let session = sqlx::query_as::<_, WsUserSession>(
-        r#"
-        INSERT INTO websocket.user_sessions
-            (session_id, user_id, connected_at, last_seen_at, disconnected_at, reconnect_count, metadata)
-        VALUES
-            ($1, $2, NOW(), NOW(), NULL, 0, $3)
-        ON CONFLICT (user_id) DO UPDATE
-        SET
-            last_seen_at = NOW(),
-            disconnected_at = NULL,
-            reconnect_count = websocket.user_sessions.reconnect_count + CASE
-                WHEN websocket.user_sessions.disconnected_at IS NULL THEN 0
-                ELSE 1
-            END,
-            metadata = websocket.user_sessions.metadata || EXCLUDED.metadata
-        RETURNING
-            session_id,
-            user_id,
-            connected_at,
-            last_seen_at,
-            disconnected_at,
-            reconnect_count,
-            metadata
-        "#,
-    )
-    .bind(next_session_id)
-    .bind(user_id.map(|u| u.0))
-    .bind(metadata_json.clone())
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| LibError::database("failed to open user websocket session", e))?;
-
-    let connection_id = Uuid::new_v4();
-    let connection = sqlx::query_as::<_, WsConnection>(
+    sqlx::query_as::<_, WsConnection>(
         r#"
         INSERT INTO websocket.connections
             (connection_id, user_id, session_id, connected_at, last_seen_at, disconnected_at, metadata)
@@ -87,27 +103,18 @@ pub async fn open_connection(
         "#,
     )
     .bind(connection_id)
-    .bind(session.user_id)
-    .bind(session.session_id)
+    .bind(user_id.map(|u| u.0))
+    .bind(session_id)
     .bind(metadata_json)
-    .fetch_one(&mut *tx)
+    .fetch_one(pool)
     .await
-    .map_err(|e| LibError::database("failed to register websocket connection", e))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| LibError::database("failed to commit websocket open transaction", e))?;
-
-    Ok(ConnectionLease {
-        session,
-        connection,
-    })
+    .map_err(|e| LibError::database("failed to register websocket connection", e))
 }
 
-/// Associate an existing active session with an authenticated user.
+/// Associate an existing websocket session with an authenticated user.
 ///
-/// If another session already exists for that `user_id`, connections are moved
-/// onto the existing session and the source anonymous session is removed.
+/// If another session already exists for that user, the source session is
+/// merged into it.
 pub async fn associate_user_with_session(
     pool: &PgPool,
     session_id: Uuid,
@@ -118,6 +125,8 @@ pub async fn associate_user_with_session(
         .await
         .map_err(|e| LibError::database("failed to begin websocket association transaction", e))?;
 
+    purge_expired_anonymous_sessions_tx(&mut tx).await?;
+
     let source_session = sqlx::query_as::<_, WsUserSession>(
         r#"
         SELECT
@@ -127,9 +136,11 @@ pub async fn associate_user_with_session(
             last_seen_at,
             disconnected_at,
             reconnect_count,
-            metadata
+            metadata,
+            expires_at
         FROM websocket.user_sessions
         WHERE session_id = $1
+          AND (expires_at IS NULL OR expires_at > NOW())
         LIMIT 1
         FOR UPDATE
         "#,
@@ -144,6 +155,24 @@ pub async fn associate_user_with_session(
             anyhow!("session_id {session_id} was not found"),
         )
     })?;
+
+    if let Some(existing_user_id) = source_session.user_id {
+        if existing_user_id == user_id.0 {
+            tx.commit().await.map_err(|e| {
+                LibError::database("failed to commit websocket association transaction", e)
+            })?;
+            return Ok(source_session);
+        }
+
+        return Err(LibError::forbidden(
+            "websocket session belongs to another user",
+            anyhow!(
+                "session_id {} already belongs to user {}",
+                source_session.session_id,
+                existing_user_id
+            ),
+        ));
+    }
 
     let existing_user_session_id = sqlx::query_scalar::<_, Uuid>(
         r#"
@@ -185,6 +214,7 @@ pub async fn associate_user_with_session(
                 SET
                     disconnected_at = NULL,
                     last_seen_at = NOW(),
+                    expires_at = NULL,
                     metadata = websocket.user_sessions.metadata || $2::jsonb
                 WHERE session_id = $1
                 "#,
@@ -219,7 +249,8 @@ pub async fn associate_user_with_session(
                 SET
                     user_id = $1,
                     disconnected_at = NULL,
-                    last_seen_at = NOW()
+                    last_seen_at = NOW(),
+                    expires_at = NULL
                 WHERE session_id = $2
                 "#,
             )
@@ -257,7 +288,8 @@ pub async fn associate_user_with_session(
             last_seen_at,
             disconnected_at,
             reconnect_count,
-            metadata
+            metadata,
+            expires_at
         FROM websocket.user_sessions
         WHERE session_id = $1
         LIMIT 1
@@ -298,11 +330,15 @@ pub async fn touch_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> 
     Ok(())
 }
 
-/// Mark a connection closed and update or remove its parent session.
+/// Mark a connection closed and update or expire its parent session.
 ///
-/// Anonymous sessions (`user_id IS NULL`) are deleted once their final
-/// connection closes.
-pub async fn close_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> {
+/// Anonymous sessions (`user_id IS NULL`) are retained for
+/// `anonymous_session_ttl_seconds` to support auth redirects.
+pub async fn close_connection(
+    pool: &PgPool,
+    connection_id: Uuid,
+    anonymous_session_ttl_seconds: i64,
+) -> Result<()> {
     let mut tx = pool
         .begin()
         .await
@@ -333,7 +369,8 @@ pub async fn close_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> 
                     UPDATE websocket.user_sessions
                     SET
                         disconnected_at = NOW(),
-                        last_seen_at = NOW()
+                        last_seen_at = NOW(),
+                        expires_at = NULL
                     WHERE session_id = $1
                     "#,
                 )
@@ -346,16 +383,21 @@ pub async fn close_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> 
             } else {
                 sqlx::query(
                     r#"
-                    DELETE FROM websocket.user_sessions
+                    UPDATE websocket.user_sessions
+                    SET
+                        disconnected_at = NOW(),
+                        last_seen_at = NOW(),
+                        expires_at = NOW() + ($2 * INTERVAL '1 second')
                     WHERE session_id = $1
                       AND user_id IS NULL
                     "#,
                 )
                 .bind(session_id)
+                .bind(anonymous_session_ttl_seconds.max(1))
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
-                    LibError::database("failed to delete anonymous websocket session", e)
+                    LibError::database("failed to set anonymous websocket session expiration", e)
                 })?;
             }
         } else {
@@ -364,7 +406,8 @@ pub async fn close_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> 
                 UPDATE websocket.user_sessions
                 SET
                     disconnected_at = NULL,
-                    last_seen_at = NOW()
+                    last_seen_at = NOW(),
+                    expires_at = NULL
                 WHERE session_id = $1
                 "#,
             )
@@ -374,6 +417,8 @@ pub async fn close_connection(pool: &PgPool, connection_id: Uuid) -> Result<()> 
             .map_err(|e| LibError::database("failed to refresh websocket session heartbeat", e))?;
         }
     }
+
+    purge_expired_anonymous_sessions_tx(&mut tx).await?;
 
     tx.commit()
         .await
@@ -423,7 +468,8 @@ pub async fn get_user_session(pool: &PgPool, user_id: Uuid) -> Result<Option<WsU
             last_seen_at,
             disconnected_at,
             reconnect_count,
-            metadata
+            metadata,
+            expires_at
         FROM websocket.user_sessions
         WHERE user_id = $1
         LIMIT 1
@@ -433,6 +479,125 @@ pub async fn get_user_session(pool: &PgPool, user_id: Uuid) -> Result<Option<WsU
     .fetch_optional(pool)
     .await
     .map_err(|e| LibError::database("failed to fetch websocket session", e))
+}
+
+/// Purge expired anonymous sessions.
+pub async fn purge_expired_anonymous_sessions(pool: &PgPool) -> Result<u64> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| LibError::database("failed to begin websocket purge transaction", e))?;
+
+    let deleted = purge_expired_anonymous_sessions_tx(&mut tx).await?;
+
+    tx.commit()
+        .await
+        .map_err(|e| LibError::database("failed to commit websocket purge transaction", e))?;
+
+    Ok(deleted)
+}
+
+async fn upsert_user_session_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: UserId,
+    metadata: serde_json::Value,
+) -> core::result::Result<WsUserSession, sqlx::Error> {
+    sqlx::query_as::<_, WsUserSession>(
+        r#"
+        INSERT INTO websocket.user_sessions
+            (session_id, user_id, connected_at, last_seen_at, disconnected_at, reconnect_count, metadata, expires_at)
+        VALUES
+            ($1, $2, NOW(), NOW(), NULL, 0, $3, NULL)
+        ON CONFLICT (user_id) DO UPDATE
+        SET
+            disconnected_at = NULL,
+            last_seen_at = NOW(),
+            reconnect_count = websocket.user_sessions.reconnect_count + CASE
+                WHEN websocket.user_sessions.disconnected_at IS NULL THEN 0
+                ELSE 1
+            END,
+            metadata = websocket.user_sessions.metadata || EXCLUDED.metadata,
+            expires_at = NULL
+        RETURNING
+            session_id,
+            user_id,
+            connected_at,
+            last_seen_at,
+            disconnected_at,
+            reconnect_count,
+            metadata,
+            expires_at
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id.0)
+    .bind(metadata)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+async fn resume_anonymous_session_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: Uuid,
+    metadata: &serde_json::Value,
+) -> core::result::Result<Option<WsUserSession>, sqlx::Error> {
+    sqlx::query_as::<_, WsUserSession>(
+        r#"
+        UPDATE websocket.user_sessions
+        SET
+            disconnected_at = NULL,
+            last_seen_at = NOW(),
+            reconnect_count = websocket.user_sessions.reconnect_count + CASE
+                WHEN websocket.user_sessions.disconnected_at IS NULL THEN 0
+                ELSE 1
+            END,
+            metadata = websocket.user_sessions.metadata || $2::jsonb,
+            expires_at = NULL
+        WHERE session_id = $1
+          AND user_id IS NULL
+          AND (expires_at IS NULL OR expires_at > NOW())
+        RETURNING
+            session_id,
+            user_id,
+            connected_at,
+            last_seen_at,
+            disconnected_at,
+            reconnect_count,
+            metadata,
+            expires_at
+        "#,
+    )
+    .bind(session_id)
+    .bind(metadata)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+async fn create_anonymous_session_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    metadata: serde_json::Value,
+) -> core::result::Result<WsUserSession, sqlx::Error> {
+    sqlx::query_as::<_, WsUserSession>(
+        r#"
+        INSERT INTO websocket.user_sessions
+            (session_id, user_id, connected_at, last_seen_at, disconnected_at, reconnect_count, metadata, expires_at)
+        VALUES
+            ($1, NULL, NOW(), NOW(), NULL, 0, $2, NULL)
+        RETURNING
+            session_id,
+            user_id,
+            connected_at,
+            last_seen_at,
+            disconnected_at,
+            reconnect_count,
+            metadata,
+            expires_at
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(metadata)
+    .fetch_one(&mut **tx)
+    .await
 }
 
 async fn active_connection_count_for_session_tx(
@@ -455,4 +620,21 @@ async fn active_connection_count_for_session_tx(
             anyhow!(e).context(format!("session_id={session_id}")),
         )
     })
+}
+
+async fn purge_expired_anonymous_sessions_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<u64> {
+    sqlx::query(
+        r#"
+        DELETE FROM websocket.user_sessions
+        WHERE user_id IS NULL
+          AND expires_at IS NOT NULL
+          AND expires_at <= NOW()
+        "#,
+    )
+    .execute(&mut **tx)
+    .await
+    .map(|res| res.rows_affected())
+    .map_err(|e| LibError::database("failed to purge expired anonymous websocket sessions", e))
 }

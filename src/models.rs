@@ -61,6 +61,7 @@ pub struct WsUserSession {
     pub disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
     pub reconnect_count: i64,
     pub metadata: serde_json::Value,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[cfg(feature = "sqlx")]
@@ -78,7 +79,7 @@ pub struct WsConnection {
 }
 
 #[cfg(feature = "sqlx")]
-/// Combined result from opening a websocket connection.
+/// Combined session + connection lease.
 #[derive(Debug, Clone)]
 pub struct ConnectionLease {
     pub session: WsUserSession,
