@@ -8,7 +8,8 @@
 
 #[cfg(feature = "api")]
 pub use crate::api::{
-    HandlesWebSocketEvents, HasPool, HasWsHub, JsonDispatch, OutboundMessage, WsApp, WsHub, routes,
+    HandlesWebSocketEvents, HasPool, HasWsHub, JsonDispatch, OutboundMessage,
+    SessionIngressMessage, SessionManager, WsApp, WsHub, routes,
 };
 
 #[cfg(feature = "sqlx")]

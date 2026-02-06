@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use subseq_auth::prelude::{MaybeAuthenticatedUser, ValidatesIdentity};
 use subseq_auth::user_id::UserId;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::db;
@@ -26,6 +26,96 @@ use crate::models::{ConnectionMetadata, WsContext};
 
 const WS_SESSION_COOKIE: &str = "subseq_ws_session";
 const DEFAULT_ANON_SESSION_TTL_SECONDS: i64 = 300;
+
+/// Inbound message stream item for one active websocket session.
+#[derive(Debug, Clone)]
+pub enum SessionIngressMessage {
+    Connected(WsContext),
+    Text {
+        context: WsContext,
+        payload: String,
+    },
+    Binary {
+        context: WsContext,
+        payload: Bytes,
+    },
+    UnauthorizedInbound {
+        context: WsContext,
+        message_kind: &'static str,
+    },
+    Disconnected(WsContext),
+}
+
+/// Manager for a single active websocket session.
+///
+/// Use `take_ingress_stream()` once to obtain a receiver you can consume with
+/// `while let Some(message) = stream.recv().await { ... }`.
+///
+/// Keep an `Arc<SessionManager>` where you need to send egress payloads back to
+/// that same session.
+pub struct SessionManager {
+    session_id: Uuid,
+    hub: WsHub,
+    ingress_tx: StdMutex<Option<mpsc::UnboundedSender<SessionIngressMessage>>>,
+    ingress_rx: TokioMutex<Option<mpsc::UnboundedReceiver<SessionIngressMessage>>>,
+}
+
+impl SessionManager {
+    fn new(session_id: Uuid, hub: WsHub) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            session_id,
+            hub,
+            ingress_tx: StdMutex::new(Some(tx)),
+            ingress_rx: TokioMutex::new(Some(rx)),
+        }
+    }
+
+    /// Return this manager's session identifier.
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    /// Take the ingress stream receiver for this session.
+    ///
+    /// This can be taken only once. Subsequent calls return `None`.
+    pub async fn take_ingress_stream(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<SessionIngressMessage>> {
+        self.ingress_rx.lock().await.take()
+    }
+
+    /// Send a JSON payload to all active connections in this session.
+    pub async fn send_json<T: Serialize>(&self, payload: &T) -> Result<usize> {
+        self.hub
+            .send_json_to_session(self.session_id, payload)
+            .await
+    }
+
+    /// Send a text payload to all active connections in this session.
+    pub async fn send_text(&self, payload: impl Into<String>) -> usize {
+        self.hub
+            .send_text_to_session(self.session_id, payload)
+            .await
+    }
+
+    /// Send a binary payload to all active connections in this session.
+    pub async fn send_binary(&self, payload: Bytes) -> usize {
+        self.hub
+            .send_binary_to_session(self.session_id, payload)
+            .await
+    }
+
+    fn push_ingress(&self, message: SessionIngressMessage) {
+        if let Some(tx) = self.ingress_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(message);
+        }
+    }
+
+    fn close_ingress(&self) {
+        self.ingress_tx.lock().unwrap().take();
+    }
+}
 
 /// In-memory fan-out hub keyed by active sessions and optionally by user.
 ///
@@ -40,6 +130,7 @@ pub struct WsHub {
 struct HubState {
     users: HashMap<Uuid, HashMap<Uuid, mpsc::UnboundedSender<OutboundMessage>>>,
     sessions: HashMap<Uuid, HashMap<Uuid, mpsc::UnboundedSender<OutboundMessage>>>,
+    managers: HashMap<Uuid, Arc<SessionManager>>,
 }
 
 impl Default for WsHub {
@@ -63,8 +154,14 @@ impl WsHub {
         session_id: Uuid,
         connection_id: Uuid,
         tx: mpsc::UnboundedSender<OutboundMessage>,
-    ) {
+    ) -> Arc<SessionManager> {
+        let hub = self.clone();
         let mut guard = self.inner.write().await;
+        let manager = guard
+            .managers
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(SessionManager::new(session_id, hub)))
+            .clone();
 
         guard
             .sessions
@@ -79,6 +176,8 @@ impl WsHub {
                 .or_default()
                 .insert(connection_id, tx);
         }
+
+        manager
     }
 
     /// Unregister a connection from all fan-out indexes.
@@ -89,6 +188,9 @@ impl WsHub {
             session_map.remove(&connection_id);
             if session_map.is_empty() {
                 guard.sessions.remove(&session_id);
+                if let Some(manager) = guard.managers.remove(&session_id) {
+                    manager.close_ingress();
+                }
             }
         }
 
@@ -124,6 +226,12 @@ impl WsHub {
         }
 
         linked
+    }
+
+    /// Get the active session manager for a session id.
+    pub async fn session_manager(&self, session_id: Uuid) -> Option<Arc<SessionManager>> {
+        let guard = self.inner.read().await;
+        guard.managers.get(&session_id).cloned()
     }
 
     /// Serialize and send a JSON payload to all active connections for one user.
@@ -249,6 +357,10 @@ impl WsHub {
         });
 
         guard.users.retain(|_, user_map| !user_map.is_empty());
+        let active_sessions: HashSet<Uuid> = guard.sessions.keys().copied().collect();
+        guard
+            .managers
+            .retain(|session_id, _| active_sessions.contains(session_id));
 
         delivered
     }
@@ -452,8 +564,10 @@ async fn run_socket<S>(
 
     let (tx, rx) = mpsc::unbounded_channel();
     let hub = app.ws_hub();
-    hub.register(user_id, session_id, connection.connection_id, tx.clone())
+    let session_manager = hub
+        .register(user_id, session_id, connection.connection_id, tx.clone())
         .await;
+    session_manager.push_ingress(SessionIngressMessage::Connected(context.clone()));
 
     if let Err(err) = app.on_connect(context.clone()).await {
         tracing::warn!(
@@ -502,6 +616,10 @@ async fn run_socket<S>(
                 }
 
                 if user_id.is_none() {
+                    session_manager.push_ingress(SessionIngressMessage::UnauthorizedInbound {
+                        context: context.clone(),
+                        message_kind: "text",
+                    });
                     if !reject_unauthorized_incoming(
                         &tx,
                         session_id,
@@ -512,6 +630,11 @@ async fn run_socket<S>(
                     }
                     continue;
                 }
+
+                session_manager.push_ingress(SessionIngressMessage::Text {
+                    context: context.clone(),
+                    payload: text.clone(),
+                });
 
                 match serde_json::from_str::<S::IncomingJson>(&text) {
                     Ok(json_message) => {
@@ -538,6 +661,10 @@ async fn run_socket<S>(
             }
             Message::Binary(payload) => {
                 if user_id.is_none() {
+                    session_manager.push_ingress(SessionIngressMessage::UnauthorizedInbound {
+                        context: context.clone(),
+                        message_kind: "binary",
+                    });
                     if !reject_unauthorized_incoming(
                         &tx,
                         session_id,
@@ -548,6 +675,11 @@ async fn run_socket<S>(
                     }
                     continue;
                 }
+
+                session_manager.push_ingress(SessionIngressMessage::Binary {
+                    context: context.clone(),
+                    payload: payload.clone(),
+                });
 
                 if let Err(err) = app.on_binary(context.clone(), payload).await {
                     tracing::warn!(
@@ -564,6 +696,7 @@ async fn run_socket<S>(
         }
     }
 
+    session_manager.push_ingress(SessionIngressMessage::Disconnected(context.clone()));
     hub.unregister(user_id, session_id, connection.connection_id)
         .await;
     let _ = tx.send(OutboundMessage::Close);
