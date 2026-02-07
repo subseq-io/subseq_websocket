@@ -13,7 +13,7 @@ once_cell = { version = "1.21.3", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sqlx = { version = "0.8.6", optional = true, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "chrono", "json"] }
-subseq_auth = { path = "../subseq_auth", optional = true }
+subseq_auth = { optional=true, git = "https://github.com/subseq-io/subseq_auth.git", branch = "main" }
 tokio = { version = "1.49.0", features = ["sync", "rt"] }
 tracing = "0.1.41"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
