@@ -506,6 +506,29 @@ where
                 .into_response();
         }
     };
+    let is_new_session = match (user_id, requested_session_id) {
+        (None, None) => true,
+        (None, Some(requested)) => requested != session.session_id,
+        // Authenticated flow does not use cookie resume. For user sessions,
+        // a freshly created row starts with reconnect_count=0 and no prior
+        // disconnect timestamp.
+        (Some(_), _) => session.reconnect_count == 0 && session.disconnected_at.is_none(),
+    };
+    if is_new_session {
+        tracing::info!(
+            session_id = %session.session_id,
+            user_id = ?user_id.map(|id| id.0),
+            "websocket session started"
+        );
+    } else {
+        tracing::debug!(
+            session_id = %session.session_id,
+            user_id = ?user_id.map(|id| id.0),
+            requested_session_id = ?requested_session_id,
+            reconnect_count = session.reconnect_count,
+            "websocket session resumed"
+        );
+    }
 
     let mut response = ws
         .on_upgrade(move |socket| async move {
