@@ -4,18 +4,20 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRef, State};
-use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::extract::{FromRef, Query, State};
+use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
-use subseq_auth::prelude::{MaybeAuthenticatedUser, ValidatesIdentity};
+use subseq_auth::prelude::{
+    AuthenticatedUser, ValidatesIdentity, validate_bearer as validate_auth_bearer,
+};
 use subseq_auth::user_id::UserId;
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 use uuid::Uuid;
@@ -26,6 +28,12 @@ use crate::models::{ConnectionMetadata, WsContext};
 
 const WS_SESSION_COOKIE: &str = "subseq_ws_session";
 const DEFAULT_ANON_SESSION_TTL_SECONDS: i64 = 300;
+
+#[derive(Debug, Deserialize, Default)]
+struct WsConnectQuery {
+    #[serde(default)]
+    token: Option<String>,
+}
 
 /// Inbound message stream item for one active websocket session.
 #[derive(Debug, Clone)]
@@ -438,16 +446,67 @@ impl<T> WsApp for T where
 {
 }
 
+async fn resolve_user_from_query_or_header<S>(
+    app: &S,
+    query: &WsConnectQuery,
+    headers: &HeaderMap,
+) -> Option<UserId>
+where
+    S: WsApp,
+{
+    if let Some(token) = query.token.as_deref() {
+        return validate_user_id_from_token(app, token).await;
+    }
+
+    let bearer = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if let Some(token) = bearer {
+        return validate_user_id_from_token(app, token).await;
+    }
+
+    None
+}
+
+async fn validate_user_id_from_token<S>(app: &S, raw: &str) -> Option<UserId>
+where
+    S: WsApp,
+{
+    let candidate = raw.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    let normalized = if candidate.len() >= 7 && candidate[..7].eq_ignore_ascii_case("bearer ") {
+        candidate.to_string()
+    } else {
+        format!("Bearer {}", candidate)
+    };
+    let (token, claims) = match validate_auth_bearer(app, &normalized) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::debug!(error = %err, "websocket token validation failed");
+            return None;
+        }
+    };
+    match AuthenticatedUser::from_claims(token, claims).await {
+        Ok(auth_user) => Some(auth_user.id()),
+        Err(err) => {
+            tracing::debug!(error = %err, "websocket authenticated user derivation failed");
+            None
+        }
+    }
+}
+
 async fn ws_handler<S>(
     ws: WebSocketUpgrade,
     State(app): State<S>,
-    auth_user: MaybeAuthenticatedUser,
+    Query(query): Query<WsConnectQuery>,
     headers: HeaderMap,
 ) -> Response
 where
     S: WsApp,
 {
-    let user_id = auth_user.0.map(|u| u.id());
+    let user_id = resolve_user_from_query_or_header(&app, &query, &headers).await;
     let metadata = metadata_from_headers(&headers);
     let anonymous_session_ttl_seconds = anonymous_session_ttl_seconds();
     let requested_session_id = session_id_from_cookie(&headers);
@@ -565,7 +624,8 @@ async fn run_socket<S>(
     S: WsApp,
 {
     let pool = app.pool();
-    let user_tag = user_id
+    let mut user_id = user_id;
+    let mut user_tag = user_id
         .map(|id| id.to_string())
         .unwrap_or_else(|| "anonymous".to_string());
 
@@ -583,7 +643,7 @@ async fn run_socket<S>(
             }
         };
 
-    let context = WsContext::new(user_id, session_id, connection.connection_id, metadata);
+    let mut context = WsContext::new(user_id, session_id, connection.connection_id, metadata.clone());
 
     let (tx, rx) = mpsc::unbounded_channel();
     let hub = app.ws_hub();
@@ -639,6 +699,59 @@ async fn run_socket<S>(
                 }
 
                 if user_id.is_none() {
+                    if let Some(auth_token) = auth_token_from_text(&text) {
+                        if let Some(authenticated_user_id) =
+                            validate_user_id_from_token(&app, &auth_token).await
+                        {
+                            user_id = Some(authenticated_user_id);
+                            user_tag = user_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "anonymous".to_string());
+
+                            match db::associate_user_with_session(
+                                pool.as_ref(),
+                                session_id,
+                                authenticated_user_id,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    let linked = hub
+                                        .associate_user_with_session(
+                                            session_id,
+                                            authenticated_user_id.0,
+                                        )
+                                        .await;
+                                    tracing::info!(
+                                        user_id = %authenticated_user_id,
+                                        session_id = %session_id,
+                                        connection_id = %connection.connection_id,
+                                        linked,
+                                        "websocket session authenticated via socket protocol"
+                                    );
+                                    context = WsContext::new(
+                                        user_id,
+                                        session_id,
+                                        connection.connection_id,
+                                        metadata.clone(),
+                                    );
+                                    let _ = tx
+                                        .send(OutboundMessage::Text("AUTHORIZED".to_string()));
+                                    continue;
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        user_id = %authenticated_user_id,
+                                        session_id = %session_id,
+                                        connection_id = %connection.connection_id,
+                                        error = %err,
+                                        "failed to associate websocket session after auth message"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     session_manager.push_ingress(SessionIngressMessage::UnauthorizedInbound {
                         context: context.clone(),
                         message_kind: "text",
@@ -850,9 +963,13 @@ where
 /// Exposes:
 /// - `GET /ws`
 ///
-/// `AuthenticatedUser` is optional. Unauthenticated sockets are accepted but
-/// treated as receive-only; incoming text/binary payloads (except keepalive
-/// `PING`) are rejected.
+/// Authentication is optional at handshake.
+/// - Provide `?token=<bearer>` on the websocket URL to authenticate immediately.
+/// - Or send `AUTH <bearer>` / `{"type":"auth","token":"<bearer>"}` as the first
+///   text frame to authenticate an anonymous connection.
+///
+/// Unauthenticated sockets are receive-only; incoming text/binary payloads
+/// (except keepalive `PING` and auth-init messages) are rejected.
 ///
 /// The server sets `subseq_ws_session` as an HTTP-only cookie. Anonymous
 /// sessions use this cookie for reconnect continuity and can be reclaimed by an
@@ -864,6 +981,27 @@ where
     S: WsApp,
 {
     Router::new().route("/ws", get(ws_handler::<S>))
+}
+
+fn auth_token_from_text(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("auth ") {
+        let token = trimmed[5..].trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let kind = payload.get("type")?.as_str()?;
+    if !kind.eq_ignore_ascii_case("auth") {
+        return None;
+    }
+    let token = payload.get("token")?.as_str()?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn keepalive_reply_for_text(input: &str) -> Option<String> {
@@ -887,7 +1025,7 @@ fn keepalive_reply_for_text(input: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::keepalive_reply_for_text;
+    use super::{auth_token_from_text, keepalive_reply_for_text};
 
     #[test]
     fn keepalive_basic_ping() {
@@ -914,5 +1052,21 @@ mod tests {
     fn non_keepalive_text_is_not_handled() {
         assert_eq!(keepalive_reply_for_text("{\"type\":\"PING\"}"), None);
         assert_eq!(keepalive_reply_for_text("PONG"), None);
+    }
+
+    #[test]
+    fn auth_token_from_plain_text_message() {
+        assert_eq!(
+            auth_token_from_text("AUTH abc.def.ghi"),
+            Some("abc.def.ghi".to_string())
+        );
+    }
+
+    #[test]
+    fn auth_token_from_json_message() {
+        assert_eq!(
+            auth_token_from_text(r#"{"type":"auth","token":"abc.def.ghi"}"#),
+            Some("abc.def.ghi".to_string())
+        );
     }
 }
