@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use once_cell::sync::Lazy;
 use sqlx::PgPool;
 use sqlx::migrate::{MigrateError, Migrator};
-use subseq_auth::user_id::UserId;
+use subseq_auth::prelude::UserId;
 use uuid::Uuid;
 
 use crate::error::{LibError, Result};

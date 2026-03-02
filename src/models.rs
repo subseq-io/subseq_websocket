@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
-use subseq_auth::user_id::UserId;
+use subseq_auth::prelude::UserId;
+use subseq_util::uuid_id_type;
 use uuid::Uuid;
+
+uuid_id_type!(ConnectionId, "connection");
+uuid_id_type!(SessionId, "session");
 
 /// Best-effort metadata captured from websocket upgrade headers.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -25,8 +29,8 @@ impl ConnectionMetadata {
 #[derive(Debug, Clone)]
 pub struct WsContext {
     pub user_id: Option<UserId>,
-    pub session_id: Uuid,
-    pub connection_id: Uuid,
+    pub session_id: SessionId,
+    pub connection_id: ConnectionId,
     pub metadata: ConnectionMetadata,
 }
 
@@ -34,8 +38,8 @@ impl WsContext {
     /// Build a new handler context.
     pub fn new(
         user_id: Option<UserId>,
-        session_id: Uuid,
-        connection_id: Uuid,
+        session_id: SessionId,
+        connection_id: ConnectionId,
         metadata: ConnectionMetadata,
     ) -> Self {
         Self {

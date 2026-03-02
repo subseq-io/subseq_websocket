@@ -12,19 +12,18 @@ use axum::routing::get;
 use bytes::Bytes;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use subseq_auth::prelude::{
-    AuthenticatedUser, ValidatesIdentity, validate_bearer as validate_auth_bearer,
+    AuthenticatedUser, UserId, ValidatesIdentity, validate_bearer as validate_auth_bearer,
 };
-use subseq_auth::user_id::UserId;
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::db;
 use crate::error::{ErrorKind, LibError, Result};
-use crate::models::{ConnectionMetadata, WsContext};
+use crate::models::{ConnectionId, ConnectionMetadata, SessionId, WsContext};
 
 const WS_SESSION_COOKIE: &str = "subseq_ws_session";
 const DEFAULT_ANON_SESSION_TTL_SECONDS: i64 = 300;
@@ -62,14 +61,14 @@ pub enum SessionIngressMessage {
 /// Keep an `Arc<SessionManager>` where you need to send egress payloads back to
 /// that same session.
 pub struct SessionManager {
-    session_id: Uuid,
+    session_id: SessionId,
     hub: WsHub,
     ingress_tx: StdMutex<Option<mpsc::UnboundedSender<SessionIngressMessage>>>,
     ingress_rx: TokioMutex<Option<mpsc::UnboundedReceiver<SessionIngressMessage>>>,
 }
 
 impl SessionManager {
-    fn new(session_id: Uuid, hub: WsHub) -> Self {
+    fn new(session_id: SessionId, hub: WsHub) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             session_id,
@@ -80,7 +79,7 @@ impl SessionManager {
     }
 
     /// Return this manager's session identifier.
-    pub fn session_id(&self) -> Uuid {
+    pub fn session_id(&self) -> SessionId {
         self.session_id
     }
 
@@ -136,9 +135,9 @@ pub struct WsHub {
 
 #[derive(Default)]
 struct HubState {
-    users: HashMap<Uuid, HashMap<Uuid, mpsc::UnboundedSender<OutboundMessage>>>,
-    sessions: HashMap<Uuid, HashMap<Uuid, mpsc::UnboundedSender<OutboundMessage>>>,
-    managers: HashMap<Uuid, Arc<SessionManager>>,
+    users: HashMap<UserId, HashMap<ConnectionId, mpsc::UnboundedSender<OutboundMessage>>>,
+    sessions: HashMap<SessionId, HashMap<ConnectionId, mpsc::UnboundedSender<OutboundMessage>>>,
+    managers: HashMap<SessionId, Arc<SessionManager>>,
 }
 
 impl Default for WsHub {
@@ -159,8 +158,8 @@ impl WsHub {
     pub async fn register(
         &self,
         user_id: Option<UserId>,
-        session_id: Uuid,
-        connection_id: Uuid,
+        session_id: SessionId,
+        connection_id: ConnectionId,
         tx: mpsc::UnboundedSender<OutboundMessage>,
     ) -> Arc<SessionManager> {
         let hub = self.clone();
@@ -180,7 +179,7 @@ impl WsHub {
         if let Some(user_id) = user_id {
             guard
                 .users
-                .entry(user_id.0)
+                .entry(user_id)
                 .or_default()
                 .insert(connection_id, tx);
         }
@@ -189,7 +188,12 @@ impl WsHub {
     }
 
     /// Unregister a connection from all fan-out indexes.
-    pub async fn unregister(&self, user_id: Option<UserId>, session_id: Uuid, connection_id: Uuid) {
+    pub async fn unregister(
+        &self,
+        user_id: Option<UserId>,
+        session_id: SessionId,
+        connection_id: ConnectionId,
+    ) {
         let mut guard = self.inner.write().await;
 
         if let Some(session_map) = guard.sessions.get_mut(&session_id) {
@@ -203,10 +207,10 @@ impl WsHub {
         }
 
         if let Some(user_id) = user_id {
-            if let Some(user_map) = guard.users.get_mut(&user_id.0) {
+            if let Some(user_map) = guard.users.get_mut(&user_id) {
                 user_map.remove(&connection_id);
                 if user_map.is_empty() {
-                    guard.users.remove(&user_id.0);
+                    guard.users.remove(&user_id);
                 }
             }
         }
@@ -216,7 +220,7 @@ impl WsHub {
     ///
     /// Call this after persisting auth state if a previously anonymous session
     /// should now be addressable by `user_id`.
-    pub async fn associate_user_with_session(&self, session_id: Uuid, user_id: Uuid) -> usize {
+    pub async fn associate_user_with_session(&self, session_id: SessionId, user_id: UserId) -> usize {
         let mut guard = self.inner.write().await;
 
         let Some(session_map) = guard.sessions.get(&session_id) else {
@@ -237,7 +241,7 @@ impl WsHub {
     }
 
     /// Get the active session manager for a session id.
-    pub async fn session_manager(&self, session_id: Uuid) -> Option<Arc<SessionManager>> {
+    pub async fn session_manager(&self, session_id: SessionId) -> Option<Arc<SessionManager>> {
         let guard = self.inner.read().await;
         guard.managers.get(&session_id).cloned()
     }
@@ -245,7 +249,7 @@ impl WsHub {
     /// Serialize and send a JSON payload to all active connections for one user.
     pub async fn send_json_to_user<T: Serialize>(
         &self,
-        user_id: Uuid,
+        user_id: UserId,
         payload: &T,
     ) -> Result<usize> {
         let text = serde_json::to_string(payload)
@@ -256,13 +260,13 @@ impl WsHub {
     }
 
     /// Send a raw text payload to all active connections for one user.
-    pub async fn send_text_to_user(&self, user_id: Uuid, payload: impl Into<String>) -> usize {
+    pub async fn send_text_to_user(&self, user_id: UserId, payload: impl Into<String>) -> usize {
         self.send_to_user(user_id, OutboundMessage::Text(payload.into()))
             .await
     }
 
     /// Send a raw binary payload to all active connections for one user.
-    pub async fn send_binary_to_user(&self, user_id: Uuid, payload: Bytes) -> usize {
+    pub async fn send_binary_to_user(&self, user_id: UserId, payload: Bytes) -> usize {
         self.send_to_user(user_id, OutboundMessage::Binary(payload))
             .await
     }
@@ -270,7 +274,7 @@ impl WsHub {
     /// Serialize and send a JSON payload to all active connections for one session.
     pub async fn send_json_to_session<T: Serialize>(
         &self,
-        session_id: Uuid,
+        session_id: SessionId,
         payload: &T,
     ) -> Result<usize> {
         let text = serde_json::to_string(payload)
@@ -283,7 +287,7 @@ impl WsHub {
     /// Send a raw text payload to all active connections for one session.
     pub async fn send_text_to_session(
         &self,
-        session_id: Uuid,
+        session_id: SessionId,
         payload: impl Into<String>,
     ) -> usize {
         self.send_to_session(session_id, OutboundMessage::Text(payload.into()))
@@ -291,7 +295,7 @@ impl WsHub {
     }
 
     /// Send a raw binary payload to all active connections for one session.
-    pub async fn send_binary_to_session(&self, session_id: Uuid, payload: Bytes) -> usize {
+    pub async fn send_binary_to_session(&self, session_id: SessionId, payload: Bytes) -> usize {
         self.send_to_session(session_id, OutboundMessage::Binary(payload))
             .await
     }
@@ -303,7 +307,7 @@ impl WsHub {
         Ok(self.broadcast(OutboundMessage::Text(text)).await)
     }
 
-    async fn send_to_user(&self, user_id: Uuid, payload: OutboundMessage) -> usize {
+    async fn send_to_user(&self, user_id: UserId, payload: OutboundMessage) -> usize {
         let mut guard = self.inner.write().await;
         let mut delivered = 0;
 
@@ -325,7 +329,7 @@ impl WsHub {
         delivered
     }
 
-    async fn send_to_session(&self, session_id: Uuid, payload: OutboundMessage) -> usize {
+    async fn send_to_session(&self, session_id: SessionId, payload: OutboundMessage) -> usize {
         let mut guard = self.inner.write().await;
         let mut delivered = 0;
 
@@ -365,7 +369,7 @@ impl WsHub {
         });
 
         guard.users.retain(|_, user_map| !user_map.is_empty());
-        let active_sessions: HashSet<Uuid> = guard.sessions.keys().copied().collect();
+        let active_sessions: HashSet<SessionId> = guard.sessions.keys().copied().collect();
         guard
             .managers
             .retain(|session_id, _| active_sessions.contains(session_id));
@@ -512,11 +516,11 @@ where
     let requested_session_id = session_id_from_cookie(&headers);
 
     if let (Some(user_id), Some(session_id)) = (user_id, requested_session_id) {
-        match db::associate_user_with_session(app.pool().as_ref(), session_id, user_id).await {
+        match db::associate_user_with_session(app.pool().as_ref(), session_id.0, user_id).await {
             Ok(_) => {
                 let linked = app
                     .ws_hub()
-                    .associate_user_with_session(session_id, user_id.0)
+                    .associate_user_with_session(session_id, user_id)
                     .await;
                 tracing::debug!(
                     user_id = %user_id,
@@ -541,7 +545,7 @@ where
         app.pool().as_ref(),
         user_id,
         if user_id.is_none() {
-            requested_session_id
+            requested_session_id.map(|session_id| session_id.0)
         } else {
             None
         },
@@ -567,7 +571,7 @@ where
     };
     let is_new_session = match (user_id, requested_session_id) {
         (None, None) => true,
-        (None, Some(requested)) => requested != session.session_id,
+        (None, Some(requested)) => requested != SessionId(session.session_id),
         // Authenticated flow does not use cookie resume. For user sessions,
         // a freshly created row starts with reconnect_count=0 and no prior
         // disconnect timestamp.
@@ -595,7 +599,7 @@ where
                 app,
                 socket,
                 user_id,
-                session.session_id,
+                SessionId(session.session_id),
                 metadata,
                 anonymous_session_ttl_seconds,
             )
@@ -604,7 +608,7 @@ where
         .into_response();
 
     if let Ok(set_cookie) = HeaderValue::from_str(&session_cookie_header_value(
-        session.session_id,
+        SessionId(session.session_id),
         anonymous_session_ttl_seconds,
     )) {
         response.headers_mut().append(SET_COOKIE, set_cookie);
@@ -617,7 +621,7 @@ async fn run_socket<S>(
     app: S,
     socket: WebSocket,
     user_id: Option<UserId>,
-    session_id: Uuid,
+    session_id: SessionId,
     metadata: ConnectionMetadata,
     anonymous_session_ttl_seconds: i64,
 ) where
@@ -630,7 +634,7 @@ async fn run_socket<S>(
         .unwrap_or_else(|| "anonymous".to_string());
 
     let connection =
-        match db::register_connection(pool.as_ref(), session_id, user_id, &metadata).await {
+        match db::register_connection(pool.as_ref(), session_id.0, user_id, &metadata).await {
             Ok(connection) => connection,
             Err(err) => {
                 tracing::error!(
@@ -642,13 +646,19 @@ async fn run_socket<S>(
                 return;
             }
         };
+    let connection_id = ConnectionId(connection.connection_id);
 
-    let mut context = WsContext::new(user_id, session_id, connection.connection_id, metadata.clone());
+    let mut context = WsContext::new(
+        user_id,
+        session_id,
+        connection_id,
+        metadata.clone(),
+    );
 
     let (tx, rx) = mpsc::unbounded_channel();
     let hub = app.ws_hub();
     let session_manager = hub
-        .register(user_id, session_id, connection.connection_id, tx.clone())
+        .register(user_id, session_id, connection_id, tx.clone())
         .await;
     session_manager.push_ingress(SessionIngressMessage::Connected(context.clone()));
 
@@ -680,9 +690,9 @@ async fn run_socket<S>(
             }
         };
 
-        if let Err(err) = db::touch_connection(pool.as_ref(), connection.connection_id).await {
+        if let Err(err) = db::touch_connection(pool.as_ref(), connection_id.0).await {
             tracing::debug!(
-                connection_id = %connection.connection_id,
+                connection_id = %connection_id,
                 error = %err,
                 "failed to update websocket heartbeat"
             );
@@ -710,7 +720,7 @@ async fn run_socket<S>(
 
                             match db::associate_user_with_session(
                                 pool.as_ref(),
-                                session_id,
+                                session_id.0,
                                 authenticated_user_id,
                             )
                             .await
@@ -719,7 +729,7 @@ async fn run_socket<S>(
                                     let linked = hub
                                         .associate_user_with_session(
                                             session_id,
-                                            authenticated_user_id.0,
+                                            authenticated_user_id,
                                         )
                                         .await;
                                     tracing::info!(
@@ -732,11 +742,11 @@ async fn run_socket<S>(
                                     context = WsContext::new(
                                         user_id,
                                         session_id,
-                                        connection.connection_id,
+                                        connection_id,
                                         metadata.clone(),
                                     );
-                                    let _ = tx
-                                        .send(OutboundMessage::Text("AUTHORIZED".to_string()));
+                                    let _ =
+                                        tx.send(OutboundMessage::Text("AUTHORIZED".to_string()));
                                     continue;
                                 }
                                 Err(err) => {
@@ -759,7 +769,7 @@ async fn run_socket<S>(
                     if !reject_unauthorized_incoming(
                         &tx,
                         session_id,
-                        connection.connection_id,
+                        connection_id,
                         "text",
                     ) {
                         break;
@@ -804,7 +814,7 @@ async fn run_socket<S>(
                     if !reject_unauthorized_incoming(
                         &tx,
                         session_id,
-                        connection.connection_id,
+                        connection_id,
                         "binary",
                     ) {
                         break;
@@ -833,8 +843,7 @@ async fn run_socket<S>(
     }
 
     session_manager.push_ingress(SessionIngressMessage::Disconnected(context.clone()));
-    hub.unregister(user_id, session_id, connection.connection_id)
-        .await;
+    hub.unregister(user_id, session_id, connection_id).await;
     let _ = tx.send(OutboundMessage::Close);
     drop(tx);
     let _ = writer.await;
@@ -851,7 +860,7 @@ async fn run_socket<S>(
 
     if let Err(err) = db::close_connection(
         pool.as_ref(),
-        connection.connection_id,
+        connection_id.0,
         anonymous_session_ttl_seconds,
     )
     .await
@@ -868,8 +877,8 @@ async fn run_socket<S>(
 
 fn reject_unauthorized_incoming(
     tx: &mpsc::UnboundedSender<OutboundMessage>,
-    session_id: Uuid,
-    connection_id: Uuid,
+    session_id: SessionId,
+    connection_id: ConnectionId,
     message_kind: &'static str,
 ) -> bool {
     tracing::debug!(
@@ -916,7 +925,7 @@ fn metadata_from_headers(headers: &HeaderMap) -> ConnectionMetadata {
     }
 }
 
-fn session_id_from_cookie(headers: &HeaderMap) -> Option<Uuid> {
+fn session_id_from_cookie(headers: &HeaderMap) -> Option<SessionId> {
     for cookie_header in headers.get_all(COOKIE) {
         let raw_cookie = cookie_header.to_str().ok()?;
         for pair in raw_cookie.split(';') {
@@ -924,7 +933,7 @@ fn session_id_from_cookie(headers: &HeaderMap) -> Option<Uuid> {
             let (name, value) = pair.split_once('=')?;
             if name == WS_SESSION_COOKIE {
                 if let Ok(session_id) = Uuid::parse_str(value) {
-                    return Some(session_id);
+                    return Some(SessionId(session_id));
                 }
             }
         }
@@ -932,7 +941,7 @@ fn session_id_from_cookie(headers: &HeaderMap) -> Option<Uuid> {
     None
 }
 
-fn session_cookie_header_value(session_id: Uuid, anonymous_session_ttl_seconds: i64) -> String {
+fn session_cookie_header_value(session_id: SessionId, anonymous_session_ttl_seconds: i64) -> String {
     let ttl = anonymous_session_ttl_seconds.max(1);
     format!(
         "{name}={value}; Path=/; Max-Age={ttl}; HttpOnly; SameSite=Lax",

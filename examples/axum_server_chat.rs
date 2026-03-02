@@ -16,9 +16,8 @@ use sqlx::postgres::PgPoolOptions;
 use subseq_auth::db::{UserRow, create_user_tables};
 use subseq_auth::prelude::{
     AuthenticatedUser, ClaimsVerificationError, CoreIdToken, CoreIdTokenClaims, OidcToken,
-    ValidatesIdentity,
+    UserId, ValidatesIdentity,
 };
-use subseq_auth::user_id::UserId;
 use subseq_websocket::prelude::{
     HandlesWebSocketEvents, HasPool, HasWsHub, JsonDispatch, WsContext, WsHub,
     create_websocket_tables, routes,
@@ -112,7 +111,7 @@ impl HandlesWebSocketEvents for AppState {
         };
 
         if let Some(user_id) = context.user_id {
-            self.ws_hub().send_json_to_user(user_id.0, &notice).await?;
+            self.ws_hub().send_json_to_user(user_id, &notice).await?;
         } else {
             self.ws_hub()
                 .send_json_to_session(context.session_id, &notice)

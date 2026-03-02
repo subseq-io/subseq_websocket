@@ -5,8 +5,6 @@
 //! 2. Mount `routes::<AppState>()` into your axum router.
 //! 3. Optionally insert `AuthenticatedUser` into request extensions
 //!    (typically via `subseq_auth` middleware) to allow inbound writes.
-
-#[cfg(feature = "api")]
 pub use crate::api::{
     HandlesWebSocketEvents, HasPool, HasWsHub, JsonDispatch, OutboundMessage,
     SessionIngressMessage, SessionManager, WsApp, WsHub, routes,
@@ -20,7 +18,7 @@ pub use crate::db::{
 };
 
 pub use crate::error::{ErrorKind, LibError, Result};
-pub use crate::models::{ConnectionMetadata, WsContext};
+pub use crate::models::{ConnectionId, ConnectionMetadata, SessionId, WsContext};
 
 #[cfg(feature = "sqlx")]
 pub use crate::models::{ConnectionLease, WsConnection, WsUserSession};
